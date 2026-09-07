@@ -68,6 +68,10 @@ class ComparisonConfig(RunSelectionConfig):
         default="both",
         description="Which report artifacts to write: `md`, `json`, or `both`.",
     )
+    no_stats: bool = Field(
+        default=False,
+        description="Skip the statistical test step.",
+    )
 
 
 class MetricValue(BaseModel):

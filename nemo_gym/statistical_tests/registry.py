@@ -40,7 +40,7 @@ def resolve_stat_test(name: str) -> StatTest:
     return STAT_TESTS[name]
 
 
-def build_config(test: StatTest, config_dict: Dict[str, Any]) -> StatTestConfig:
+def build_config(test: StatTest, config_dict: Any) -> StatTestConfig:
     """Validate `config_dict` against `test`, rejecting another test's flags instead of ignoring them.
 
     Pydantic drops unknown keys, so without this a flag belonging to a different test (`--margin` under

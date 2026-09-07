@@ -18,7 +18,7 @@ from nemo_gym.comparison.schema import RunFile
 from nemo_gym.config_types import ConfigError
 from nemo_gym.package_info import __version__
 from nemo_gym.secret_utils import hide_secrets_in_overrides
-from nemo_gym.statistical_tests.schema import STATS_SUBDIR_NAME, StatTestConfig, StatTestReport
+from nemo_gym.statistical_tests.schema import DEFAULT_STAT_TEST, STATS_SUBDIR_NAME, StatTestConfig, StatTestReport
 
 
 MISSING = "—"
@@ -118,10 +118,13 @@ def report_stem(config: StatTestConfig, report: StatTestReport) -> str:
 
 
 def resolve_output_dir(config: StatTestConfig) -> Path:
+    """`<--output-dir, or the candidate run's own directory>/statistical_tests/`. Always nested."""
     if config.output_dirpath:
-        p = Path(config.output_dirpath)
-        return p if p.is_absolute() else Path.cwd() / p
-    return _resolve_under_cwd_or_install(config.candidate_rollouts_jsonl_fpaths[-1]).parent / STATS_SUBDIR_NAME
+        base = Path(config.output_dirpath)
+        base = base if base.is_absolute() else Path.cwd() / base
+    else:
+        base = _resolve_under_cwd_or_install(config.candidate_rollouts_jsonl_fpaths[-1]).parent
+    return base / STATS_SUBDIR_NAME
 
 
 def write_reports(output_dir: Path, stem: str, *, report_format: str, markdown: str, payload: dict) -> List[Path]:
@@ -139,3 +142,24 @@ def write_reports(output_dir: Path, stem: str, *, report_format: str, markdown: 
         return written
     except OSError as e:
         raise ConfigError(f"Cannot write the report into '{output_dir}': {e}") from e
+
+
+def _stat_test(config: Any, subcommand: str) -> None:
+    from nemo_gym.statistical_tests.common import invoked_command
+    from nemo_gym.statistical_tests.registry import resolve_stat_test, run_stat_test
+
+    test = resolve_stat_test(config.test)
+    # Record whichever command actually ran: sys.argv holds *its* overrides, not stat-test's.
+    report, written = run_stat_test(test, config, invoked_command(subcommand))
+    print("\n".join(test.summary(report, written)))
+
+
+def stat_test_from_config_dict(config_dict: Any, subcommand: str) -> None:
+    """Pick the test named by `--test`, validate that test's own config out of `config_dict`, run it.
+
+    The entry point for both callers: `gym eval stat-test` passes the global config dict, and
+    `gym eval compare`'s stats step passes it merged under its own config.
+    """
+    from nemo_gym.statistical_tests.registry import build_config, resolve_stat_test
+
+    _stat_test(build_config(resolve_stat_test(config_dict.get("test") or DEFAULT_STAT_TEST), config_dict), subcommand)

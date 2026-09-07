@@ -679,11 +679,20 @@ _STATISTICAL_TEST_FLAGS = (
         "Metric(s) to test, e.g. `reward` (comma-separated). Default: every key metric with per-task pairing data.",
         metavar="METRIC[,METRIC...]",
     ),
+    _comma_list_flag(
+        "margin",
+        "margin",
+        "Tolerance delta(s), e.g. 0.01 for 1pp (default: 0). One value for every metric, or one per "
+        "--metric in the same order. Ignored when --alternative is two-sided.",
+        metavar="DELTA[,DELTA...]",
+    ),
     _value_flag(
-        "margin",
-        "margin",
-        "Non-inferiority margin delta (e.g. 0.01 for 1pp). Given: one-sided test of 'candidate is not "
-        "meaningfully worse than delta'. Omitted: two-sided test of 'did anything change at all'.",
+        "alternative",
+        "alternative",
+        "Which hypothesis to test (default: two-sided). `two-sided`: did anything change at all. "
+        "`candidate-not-worse`: the candidate is not worse than --margin allows. "
+        "`candidate-not-better`: the reverse.",
+        choices=("two-sided", "candidate-not-worse", "candidate-not-better"),
     ),
     _value_flag("alpha", "alpha", "Significance level (default: 0.05)."),
 )
@@ -1147,14 +1156,6 @@ COMMANDS = {
                 choices=("md", "json", "both"),
             ),
             *_STATISTICAL_TEST_FLAGS,
-            _value_flag(
-                "stats-output-dir",
-                "stats_output_dirpath",
-                "Where to write the statistical-test step's own report (default: "
-                "`<candidate run's directory>/statistical_tests/`). Independent of --output-dir, which "
-                "controls only compare_report.*.",
-                quote=True,
-            ),
             _bool_flag("no-stats", "no_stats", "Skip the default statistical-test step."),
         ),
     ),
@@ -1178,7 +1179,7 @@ COMMANDS = {
             ),
             # Choices are spelled out rather than derived from `statistical_tests.registry`:
             # importing it here would put pydantic + the whole stats package on the path of every
-            # `gym` invocation. `test_cli_test_flag_choices_match_the_registry` pins them together.
+            # `gym` invocation.
             _value_flag("test", "test", "Statistical test to run (default: paired).", choices=("paired",)),
             *_STATISTICAL_TEST_FLAGS,
         ),

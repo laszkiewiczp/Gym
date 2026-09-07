@@ -602,39 +602,13 @@ Agent-level metrics: {agent_level_metrics_fpath}
 Repeat-level metrics: {repeat_level_metrics_fpath}""")
 
 
-def _run_stats_step_for_compare(config: Any, overrides: Dict[str, Any]) -> None:
-    """Run `gym eval compare`'s default statistics step.
-
-    `--output-dir` on `compare` keeps controlling only `compare_report.*`, so this step's own
-    location comes from `stats_output_dirpath` instead. The step is a side effect layered on a
-    comparison that already succeeded and was written, so a bad config here is reported and
-    skipped rather than allowed to fail the whole command.
-    """
-    import rich
-    from pydantic import ValidationError
-    from rich.markup import escape
-
-    from nemo_gym.statistical_tests.registry import build_config, resolve_stat_test
-    from nemo_gym.statistical_tests.schema import DEFAULT_STAT_TEST
-
-    stats_config_dict = config.model_dump(exclude={"output_dirpath"})
-    stats_config_dict.update({k: v for k, v in overrides.items() if k != "stats_output_dirpath"})
-    stats_config_dict["output_dirpath"] = overrides.get("stats_output_dirpath")
-    try:
-        test = resolve_stat_test(stats_config_dict.get("test") or DEFAULT_STAT_TEST)
-        _stat_test(build_config(test, stats_config_dict), "compare")
-    except (ConfigError, ValidationError) as e:
-        rich.print(f"[yellow]Skipped the statistical test:[/yellow] {escape(str(e))}")
-
-
 @exit_cleanly_on_config_error
 def compare() -> None:  # pragma: no cover
     from nemo_gym.comparison.report import render_key_metrics_tables, summary_lines
     from nemo_gym.comparison.runner import invoked_command, run_comparison
     from nemo_gym.comparison.schema import ComparisonConfig
 
-    global_config_dict = get_global_config_dict()
-    config = ComparisonConfig.model_validate(global_config_dict)
+    config = ComparisonConfig.model_validate(get_global_config_dict())
 
     result, written = run_comparison(config, invoked_command())
 
@@ -642,33 +616,9 @@ def compare() -> None:  # pragma: no cover
         print_rich_table(table)
     print("\n".join(summary_lines(result, written)))
 
-    if not global_config_dict.get("no_stats", False):
-        _run_stats_step_for_compare(
-            config,
-            {
-                "metric": global_config_dict.get("metric"),
-                "margin": global_config_dict.get("margin"),
-                "alpha": global_config_dict.get("alpha", 0.05),
-                "stats_output_dirpath": global_config_dict.get("stats_output_dirpath"),
-            },
-        )
-
-
-def _stat_test(config: Any, subcommand: str) -> None:
-    from nemo_gym.statistical_tests.common import invoked_command
-    from nemo_gym.statistical_tests.registry import resolve_stat_test, run_stat_test
-
-    test = resolve_stat_test(config.test)
-    # Record whichever command actually ran: sys.argv holds *its* overrides, not stat-test's.
-    report, written = run_stat_test(test, config, invoked_command(subcommand))
-    print("\n".join(test.summary(report, written)))
-
 
 @exit_cleanly_on_config_error
 def stat_test() -> None:  # pragma: no cover
-    from nemo_gym.statistical_tests.registry import build_config, resolve_stat_test
-    from nemo_gym.statistical_tests.schema import DEFAULT_STAT_TEST
+    from nemo_gym.statistical_tests.common import stat_test_from_config_dict
 
-    global_config_dict = get_global_config_dict()
-    test = resolve_stat_test(global_config_dict.get("test") or DEFAULT_STAT_TEST)
-    _stat_test(build_config(test, global_config_dict), "stat-test")
+    stat_test_from_config_dict(get_global_config_dict(), "stat-test")

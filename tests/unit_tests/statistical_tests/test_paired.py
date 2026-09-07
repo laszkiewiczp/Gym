@@ -75,18 +75,40 @@ class TestPairedTestConfig:
         config = PairedTestConfig.model_validate(BASE)
         assert config.test == "paired" and config.metric is None and config.margin is None
 
-    @pytest.mark.parametrize("margin", [0, -0.01, -5])
-    def test_non_positive_margin_is_rejected(self, margin):
-        with pytest.raises(ValidationError, match="--margin must be a positive number"):
-            PairedTestConfig.model_validate({**BASE, "margin": margin})
+    def test_the_default_is_a_two_sided_test_with_no_margin(self):
+        config = PairedTestConfig.model_validate(BASE)
+        assert config.alternative == "two-sided" and config.margin is None
 
-    def test_filename_parts_reflect_the_framing_and_the_metric_subset(self):
+    @pytest.mark.parametrize("margin", [[-0.01], [0.1, -5]])
+    def test_a_negative_margin_is_rejected(self, margin):
+        with pytest.raises(ValidationError, match="--margin must be non-negative"):
+            PairedTestConfig.model_validate({**BASE, "margin": margin, "metric": ["a", "b"]})
+
+    def test_one_margin_per_metric_is_accepted_but_a_mismatched_count_is_not(self):
+        config = PairedTestConfig.model_validate({**BASE, "metric": ["a", "b"], "margin": [0.01, 0.02]})
+        assert config.margin == [0.01, 0.02]
+        # A single value is always fine -- it applies to every metric.
+        assert PairedTestConfig.model_validate({**BASE, "metric": ["a", "b"], "margin": [0.01]}).margin == [0.01]
+        with pytest.raises(ValidationError, match="one per --metric"):
+            PairedTestConfig.model_validate({**BASE, "metric": ["a", "b"], "margin": [0.01, 0.02, 0.03]})
+
+    def test_a_margin_list_without_a_metric_list_is_rejected(self):
+        """Without --metric there is no order to line the margins up against."""
+        with pytest.raises(ValidationError, match="one per --metric"):
+            PairedTestConfig.model_validate({**BASE, "margin": [0.01, 0.02]})
+
+    def test_filename_parts_reflect_the_alternative_the_margins_and_the_metric_subset(self):
         assert PairedTestConfig.model_validate(BASE).filename_parts() == ["two-sided"]
-        assert PairedTestConfig.model_validate({**BASE, "margin": 0.01}).filename_parts() == ["margin-0.01"]
-        assert PairedTestConfig.model_validate({**BASE, "metric": ["reward", "a/b"]}).filename_parts() == [
-            "metric-reward+a-b",
-            "two-sided",
+        assert PairedTestConfig.model_validate({**BASE, "alternative": "candidate-not-worse"}).filename_parts() == [
+            "candidate-not-worse"
         ]
+        assert PairedTestConfig.model_validate({**BASE, "margin": [0.01]}).filename_parts() == [
+            "two-sided",
+            "margin-0.01",
+        ]
+        assert PairedTestConfig.model_validate(
+            {**BASE, "metric": ["reward", "a/b"], "margin": [0.01, 0.02]}
+        ).filename_parts() == ["metric-reward+a-b", "two-sided", "margin-0.01+0.02"]
 
 
 class TestPairedTaskDeltas:
@@ -119,34 +141,59 @@ class TestResolveMetrics:
 class TestRunMetric:
     def test_no_common_task_returns_a_note_rather_than_raising(self):
         baseline, candidate = _run([_g(0, **{"mean/reward": 1.0})]), _run([_g(1, **{"mean/reward": 0.0})])
-        result = run_metric(baseline, candidate, metric="reward", margin=None, alpha=0.05)
+        result = run_metric(baseline, candidate, metric="reward", margin=0.0, alpha=0.05, alternative="two-sided")
         assert result.n_pairs == 0 and result.p_value is None and "no per-task" in result.note
 
     def test_single_paired_task_cannot_estimate_se(self):
         baseline, candidate = _run([_g(0, **{"mean/reward": 1.0})]), _run([_g(0, **{"mean/reward": 0.7})])
-        result = run_metric(baseline, candidate, metric="reward", margin=None, alpha=0.05)
+        result = run_metric(baseline, candidate, metric="reward", margin=0.0, alpha=0.05, alternative="two-sided")
         assert result.n_pairs == 1 and result.se is None and "cannot estimate" in result.note
 
     def test_zero_variance_nonzero_mean_is_significant(self):
         baseline = _run([_g(i, **{"mean/reward": 0.5}) for i in range(3)])
         candidate = _run([_g(i, **{"mean/reward": 0.0}) for i in range(3)])
-        result = run_metric(baseline, candidate, metric="reward", margin=None, alpha=0.05)
+        result = run_metric(baseline, candidate, metric="reward", margin=0.0, alpha=0.05, alternative="two-sided")
         assert result.se == 0.0 and result.p_value == 0.0 and result.significant is True
 
     def test_p_value_matches_scipy_ttest_1samp_directly(self):
         deltas = [0.2, -0.1, 0.3, 0.05, -0.05, 0.15]
         baseline = _run([_g(i, **{"mean/reward": 0.0}) for i in range(len(deltas))])
         candidate = _run([_g(i, **{"mean/reward": d}) for i, d in enumerate(deltas)])
-        result = run_metric(baseline, candidate, metric="reward", margin=None, alpha=0.05)
+        result = run_metric(baseline, candidate, metric="reward", margin=0.0, alpha=0.05, alternative="two-sided")
         _, expected_p = stats.ttest_1samp(deltas, popmean=0.0)
         assert result.p_value == pytest.approx(expected_p)
 
-    def test_regression_within_margin_is_not_meaningfully_worse(self):
-        deltas = [-0.05, -0.06, -0.04, -0.05, -0.05, -0.06]
+    def _runs(self, deltas):
         baseline = _run([_g(i, **{"mean/reward": 0.0}) for i in range(len(deltas))])
-        candidate = _run([_g(i, **{"mean/reward": d}) for i, d in enumerate(deltas)])
-        result = run_metric(baseline, candidate, metric="reward", margin=0.2, alpha=0.05)
+        return baseline, _run([_g(i, **{"mean/reward": d}) for i, d in enumerate(deltas)])
+
+    def test_regression_within_margin_is_not_meaningfully_worse(self):
+        baseline, candidate = self._runs([-0.05, -0.06, -0.04, -0.05, -0.05, -0.06])
+        result = run_metric(
+            baseline, candidate, metric="reward", margin=0.2, alpha=0.05, alternative="candidate-not-worse"
+        )
         assert result.significant is True and result.p_value < 0.05
+
+    def test_a_regression_beyond_the_margin_is_not_cleared(self):
+        baseline, candidate = self._runs([-0.05, -0.06, -0.04, -0.05, -0.05, -0.06])
+        result = run_metric(
+            baseline, candidate, metric="reward", margin=0.0, alpha=0.05, alternative="candidate-not-worse"
+        )
+        assert result.significant is False
+
+    def test_candidate_not_better_mirrors_candidate_not_worse(self):
+        """Same data, opposite question: an improvement clears `not-worse` but fails `not-better`."""
+        baseline, candidate = self._runs([0.05, 0.06, 0.04, 0.05, 0.05, 0.06])
+        kwargs = dict(metric="reward", margin=0.0, alpha=0.05)
+        assert run_metric(baseline, candidate, **kwargs, alternative="candidate-not-worse").significant is True
+        assert run_metric(baseline, candidate, **kwargs, alternative="candidate-not-better").significant is False
+
+    def test_alpha_decides_significance_rather_than_a_hardcoded_level(self):
+        baseline, candidate = self._runs([0.2, -0.1, 0.3, 0.05, -0.05, 0.15])
+        kwargs = dict(metric="reward", margin=0.0, alternative="two-sided")
+        result = run_metric(baseline, candidate, **kwargs, alpha=0.05)
+        assert result.significant is False and result.p_value > 0.05
+        assert run_metric(baseline, candidate, **kwargs, alpha=0.5).significant is True
 
 
 class TestBuildReport:

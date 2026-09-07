@@ -165,9 +165,9 @@ class TestResolveOutputDir:
         )
         assert resolve_output_dir(config) == tmp_path / "run_b" / STATS_SUBDIR_NAME
 
-    def test_explicit_path_is_used_literally_with_no_nesting(self, tmp_path):
+    def test_an_explicit_path_still_nests_the_statistical_tests_directory_inside_it(self, tmp_path):
         config = StatTestConfig.model_validate({**BASE, "output_dirpath": str(tmp_path / "elsewhere")})
-        assert resolve_output_dir(config) == tmp_path / "elsewhere"
+        assert resolve_output_dir(config) == tmp_path / "elsewhere" / STATS_SUBDIR_NAME
 
 
 class TestWriteReports:

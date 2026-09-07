@@ -20,11 +20,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
 
+from pydantic import ValidationError
+
 from nemo_gym import _resolve_under_cwd_or_install
 from nemo_gym.comparison.diff import compare_runs
 from nemo_gym.comparison.loading import build_loaded_run, load_agg_metrics_file, resolve_agent_selections
 from nemo_gym.comparison.report import write_reports
 from nemo_gym.comparison.schema import ComparisonConfig, ComparisonResult
+from nemo_gym.config_types import ConfigError
 from nemo_gym.package_info import __version__
 from nemo_gym.secret_utils import hide_secrets_in_overrides
 
@@ -97,6 +100,20 @@ def resolve_output_dir(config: ComparisonConfig) -> Path:
 
 
 def run_comparison(config: ComparisonConfig, command: str) -> Tuple[ComparisonResult, List[Path]]:
-    """Build the comparison and write its report artifacts."""
+    """Build the comparison, write its report artifacts, and run the statistical test alongside it."""
     result = build_comparison_result(config, command)
-    return result, write_reports(result, resolve_output_dir(config), config.report_format)
+    written = write_reports(result, resolve_output_dir(config), config.report_format)
+
+    if not config.no_stats:
+        from nemo_gym.global_config import maybe_get_global_config_dict
+        from nemo_gym.statistical_tests.common import stat_test_from_config_dict
+
+        try:
+            # `config` wins for everything it declares; the rest carries the test's own flags.
+            stat_test_from_config_dict({**(maybe_get_global_config_dict() or {}), **config.model_dump()}, "compare")
+        except (ConfigError, ValidationError) as e:
+            # A side effect of a comparison that already succeeded and was written: report it,
+            # never turn a good `gym eval compare` into a failure.
+            print(f"Skipped the statistical test: {e}")
+
+    return result, written

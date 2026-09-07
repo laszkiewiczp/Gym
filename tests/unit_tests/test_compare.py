@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import orjson
 import pytest
+from omegaconf import OmegaConf
 
 from nemo_gym.comparison.diff import build_flip_summary, build_metric_rows, compare_runs, is_comparable_metric
 from nemo_gym.comparison.loading import (
@@ -1030,15 +1031,24 @@ class TestReportEdgeCases:
 
 
 class TestStatsWiring:
-    """`gym eval compare`'s default statistics step (`cli.eval._run_stats_step_for_compare`).
+    """`gym eval compare`'s default statistics step, now run from `run_comparison`.
 
-    This is a side effect layered on top of `compare`, not a change to it: `compare_report.*` --
-    same schema, same bytes -- is asserted unaffected. The statistics themselves are
+    A side effect layered on top of `compare`, not a change to it: `compare_report.*` -- same
+    schema, same bytes -- is asserted unaffected. The statistics themselves are
     `nemo_gym.statistical_tests`'s own responsibility and are tested there; this only checks the
     wiring (where the extra artifacts land, and that nothing about `compare`'s own output moved).
+
+    `run_comparison` re-reads the raw config for the stats flags, so every test here sets `sys.argv`
+    to the overrides it wants the step to see.
     """
 
-    def _config(self, tmp_path: Path) -> ComparisonConfig:
+    def _stats_flags(self, monkeypatch, **flags) -> None:
+        """Seed the cached global config the stats step consults for the flags compare drops."""
+        import nemo_gym.global_config as gc
+
+        monkeypatch.setattr(gc, "_GLOBAL_CONFIG_DICT", OmegaConf.create(flags) if flags else None)
+
+    def _config(self, tmp_path: Path, **overrides) -> ComparisonConfig:
         baseline = _write_run(
             tmp_path,
             "run_a",
@@ -1065,26 +1075,25 @@ class TestStatsWiring:
             {
                 "baseline_rollouts_jsonl_fpath": str(baseline),
                 "candidate_rollouts_jsonl_fpaths": [str(candidate)],
+                **overrides,
             }
         )
 
-    def test_compare_report_is_byte_identical_with_or_without_the_stats_step(self, tmp_path):
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
-
+    def test_compare_report_is_byte_identical_with_or_without_the_stats_step(self, tmp_path, monkeypatch):
+        self._stats_flags(monkeypatch)
         config = self._config(tmp_path)
-        result, written = run_comparison(config, "gym eval compare ...")
+        _, written = run_comparison(ComparisonConfig.model_validate({**config.model_dump(), "no_stats": True}), "c")
         (compare_json,) = [p for p in written if p.name == "compare_report.json"]
-        before = compare_json.read_bytes()
+        before = orjson.loads(compare_json.read_bytes())
 
-        _run_stats_step_for_compare(config, {})
+        run_comparison(config, "c")
 
-        after = compare_json.read_bytes()
-        assert before == after
+        payload = orjson.loads(compare_json.read_bytes())
+        payload.pop("generated_at"), before.pop("generated_at")
+        assert payload == before
         # And the schema itself never gained a statistics field.
-        payload = orjson.loads(before)
         assert set(payload.keys()) == {
             "schema_version",
-            "generated_at",
             "nemo_gym_version",
             "command",
             "baseline",
@@ -1095,47 +1104,46 @@ class TestStatsWiring:
         }
         assert "statistical_tests" not in payload["comparisons"][0]
 
-    def test_stats_step_writes_its_own_subdirectory_next_to_compare_report(self, tmp_path):
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
+    def test_stats_step_writes_its_own_subdirectory_next_to_compare_report(self, tmp_path, monkeypatch):
         from nemo_gym.statistical_tests.schema import STATS_SUBDIR_NAME
 
-        config = self._config(tmp_path)
-        run_comparison(config, "gym eval compare ...")
-        _run_stats_step_for_compare(config, {})
+        self._stats_flags(monkeypatch)
+        run_comparison(self._config(tmp_path), "gym eval compare ...")
 
         run_b_dir = tmp_path / "run_b"
         assert {"compare_report.md", "compare_report.json", STATS_SUBDIR_NAME}.issubset(
             {p.name for p in run_b_dir.iterdir()}
         )
-        stats_files = list((run_b_dir / STATS_SUBDIR_NAME).iterdir())
-        assert stats_files, "expected at least one statistical_tests/ artifact"
+        assert list((run_b_dir / STATS_SUBDIR_NAME).iterdir()), "expected at least one statistical_tests/ artifact"
 
-    def test_stats_output_dir_flag_redirects_without_nesting(self, tmp_path):
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
+    def test_no_stats_skips_the_step_entirely(self, tmp_path, monkeypatch):
+        self._stats_flags(monkeypatch)
+        run_comparison(self._config(tmp_path, no_stats=True), "gym eval compare ...")
+        assert not (tmp_path / "run_b" / "statistical_tests").exists()
+
+    def test_output_dir_is_shared_and_the_stats_step_nests_inside_it(self, tmp_path, monkeypatch):
+        """One --output-dir now: compare_report.* in it, the statistics under statistical_tests/."""
         from nemo_gym.statistical_tests.schema import STATS_SUBDIR_NAME
 
-        config = self._config(tmp_path)
         elsewhere = tmp_path / "elsewhere"
-        run_comparison(config, "gym eval compare ...")
-        _run_stats_step_for_compare(config, {"stats_output_dirpath": str(elsewhere)})
+        self._stats_flags(monkeypatch)
+        run_comparison(self._config(tmp_path, output_dirpath=str(elsewhere)), "gym eval compare ...")
 
-        assert elsewhere.is_dir()
-        assert not (elsewhere / STATS_SUBDIR_NAME).exists()
-        assert list(elsewhere.iterdir())
+        assert (elsewhere / "compare_report.json").exists()
+        assert list((elsewhere / STATS_SUBDIR_NAME).iterdir())
 
-    def test_metric_and_margin_overrides_flow_through(self, tmp_path):
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
+    def test_metric_margin_and_alpha_overrides_flow_through(self, tmp_path, monkeypatch):
         from nemo_gym.statistical_tests.schema import STATS_SUBDIR_NAME
 
-        config = self._config(tmp_path)
-        run_comparison(config, "gym eval compare ...")
-        _run_stats_step_for_compare(config, {"metric": ["reward"], "margin": 0.5, "alpha": 0.2})
+        self._stats_flags(monkeypatch, metric=["reward"], margin=[0.5], alpha=0.2, alternative="candidate-not-worse")
+        run_comparison(self._config(tmp_path), "gym eval compare ...")
 
         (stats_json,) = (tmp_path / "run_b" / STATS_SUBDIR_NAME).glob("*.json")
         payload = orjson.loads(stats_json.read_bytes())
         assert payload["results"][0]["metric"] == "reward"
         assert payload["results"][0]["margin"] == 0.5
         assert payload["results"][0]["alpha"] == 0.2
+        assert payload["results"][0]["alternative"] == "candidate-not-worse"
 
     def _config_without_pairing_data(self, tmp_path: Path) -> ComparisonConfig:
         """A run pair `compare` handles fine but the stats step cannot test: no per-task groups."""
@@ -1152,28 +1160,19 @@ class TestStatsWiring:
             }
         )
 
-    def test_a_stats_step_that_cannot_run_is_reported_and_skipped_not_fatal(self, tmp_path, capsys):
+    def test_a_stats_step_that_cannot_run_is_reported_and_skipped_not_fatal(self, tmp_path, monkeypatch, capsys):
         """The stats step is a side effect of a comparison that already succeeded and was written.
 
-        It must never turn a good `gym eval compare` into a non-zero exit -- `stat_test`'s own
-        `exit_cleanly_on_config_error` would otherwise raise SystemExit(1) from inside `compare`.
+        It must never turn a good `gym eval compare` into a failure.
         """
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
-
-        config = self._config_without_pairing_data(tmp_path)
-        run_comparison(config, "gym eval compare ...")
-
-        _run_stats_step_for_compare(config, {})
+        self._stats_flags(monkeypatch)
+        run_comparison(self._config_without_pairing_data(tmp_path), "gym eval compare ...")
 
         assert "Skipped the statistical test" in capsys.readouterr().out
         assert not (tmp_path / "run_b" / "statistical_tests").exists()
 
-    def test_an_invalid_stats_flag_is_reported_and_skipped_not_a_traceback(self, tmp_path, capsys):
-        from nemo_gym.cli.eval import _run_stats_step_for_compare
-
-        config = self._config(tmp_path)
-        run_comparison(config, "gym eval compare ...")
-
-        _run_stats_step_for_compare(config, {"alpha": 5.0})
+    def test_an_invalid_stats_flag_is_reported_and_skipped_not_a_traceback(self, tmp_path, monkeypatch, capsys):
+        self._stats_flags(monkeypatch, alpha=5.0)
+        run_comparison(self._config(tmp_path), "gym eval compare ...")
 
         assert "Skipped the statistical test" in capsys.readouterr().out

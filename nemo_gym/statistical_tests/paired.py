@@ -15,19 +15,33 @@ from nemo_gym.statistical_tests.common import fmt, fmt_bool, fmt_p, load_run_pai
 from nemo_gym.statistical_tests.schema import StatTestConfig, StatTestReport
 
 
+Alternative = Literal["two-sided", "candidate-not-worse", "candidate-not-better"]
+
+
 class PairedTestConfig(StatTestConfig):
     test: Literal["paired"] = "paired"
     metric: Optional[List[str]] = Field(default=None, description="Metric(s) to test, e.g. `reward`.")
-    margin: Optional[float] = Field(default=None, description="Non-inferiority margin, e.g. 0.01 for 1pp.")
+    margin: Optional[List[float]] = Field(
+        default=None,
+        description="Tolerance delta(s), e.g. 0.01 for 1pp (default 0). One value for every metric, or one "
+        "per --metric in the same order. Ignored when --alternative is two-sided.",
+    )
+    alternative: Alternative = Field(
+        default="two-sided",
+        description="`two-sided`: did anything change at all. `candidate-not-worse`: the candidate is not "
+        "worse than the margin allows. `candidate-not-better`: the reverse.",
+    )
 
     @model_validator(mode="after")
     def _check_margin(self) -> "PairedTestConfig":
-        if self.margin is not None and self.margin <= 0:
-            raise ValueError(f"--margin must be a positive number (got {self.margin}).")
+        if self.margin and (min(self.margin) < 0 or 1 < len(self.margin) != len(self.metric or [])):
+            raise ValueError("--margin must be non-negative, and either a single value or one per --metric.")
         return self
 
     def filename_parts(self) -> List[str]:
-        parts = ["two-sided" if self.margin is None else f"margin-{self.margin:g}"]
+        parts = [self.alternative]
+        if self.margin:
+            parts.append("margin-" + "+".join(f"{m:g}" for m in self.margin))
         if self.metric:
             parts.insert(0, "metric-" + "+".join(sanitize_filename_part(m) for m in self.metric))
         return parts
@@ -35,7 +49,8 @@ class PairedTestConfig(StatTestConfig):
 
 class PairedTestResult(BaseModel):
     metric: str
-    margin: Optional[float] = None
+    margin: float = 0.0
+    alternative: Alternative = "two-sided"
     alpha: float
     n_pairs: int
     mean_diff: Optional[float] = None
@@ -79,9 +94,11 @@ def resolve_metrics(baseline: LoadedRun, candidate: LoadedRun, requested: Option
     return resolved, skipped
 
 
-def run_metric(baseline: LoadedRun, candidate: LoadedRun, *, metric: str, margin: Optional[float], alpha: float):
+def run_metric(
+    baseline: LoadedRun, candidate: LoadedRun, *, metric: str, margin: float, alpha: float, alternative: Alternative
+):
     def result(**kw) -> PairedTestResult:
-        return PairedTestResult(metric=metric, margin=margin, alpha=alpha, **kw)
+        return PairedTestResult(metric=metric, margin=margin, alternative=alternative, alpha=alpha, **kw)
 
     deltas = paired_task_deltas(baseline, candidate, metric)
     if not deltas:
@@ -92,17 +109,19 @@ def run_metric(baseline: LoadedRun, candidate: LoadedRun, *, metric: str, margin
     if n < 2:
         return result(n_pairs=n, mean_diff=mean_diff, note="only 1 paired task: cannot estimate a standard error.")
 
+    # `candidate-not-worse` tests H0 mu_d <= -margin; `candidate-not-better` mirrors it at +margin.
+    sign = 1 if alternative == "candidate-not-worse" else -1
     se = (sum((d - mean_diff) ** 2 for d in deltas) / (n - 1)) ** 0.5 / n**0.5
     if se < 1e-12:
-        threshold = 0.0 if margin is None else -margin
-        significant = mean_diff != threshold if margin is None else mean_diff > threshold
+        significant = mean_diff != 0 if alternative == "two-sided" else sign * mean_diff > -margin
         p_value = 0.0 if significant else 1.0
         note = "every paired delta was identical (zero variance)."
         return result(n_pairs=n, mean_diff=mean_diff, se=0.0, p_value=p_value, significant=significant, note=note)
 
     df = n - 1
-    p_value = 2 * stats.t.sf(abs(mean_diff / se), df) if margin is None else stats.t.sf((mean_diff + margin) / se, df)
-    return result(n_pairs=n, mean_diff=mean_diff, se=se, p_value=float(p_value), significant=p_value < 0.05)
+    t_stat = mean_diff / se if alternative == "two-sided" else (mean_diff + sign * margin) / se
+    p_value = 2 * stats.t.sf(abs(t_stat), df) if alternative == "two-sided" else stats.t.sf(sign * t_stat, df)
+    return result(n_pairs=n, mean_diff=mean_diff, se=se, p_value=float(p_value), significant=p_value < alpha)
 
 
 def build_report(config: PairedTestConfig, command: str) -> PairedTestReport:
@@ -121,9 +140,13 @@ def build_report(config: PairedTestConfig, command: str) -> PairedTestReport:
         if skipped:
             notes.append(f"Skipped {len(skipped)} key metric(s) with no per-task pairing data: {', '.join(skipped)}.")
 
+    # One margin per metric: a single value (or the 0 default) applies to all; a list is per --metric.
+    margins = config.margin or [0.0]
     results = [
-        run_metric(pair.baseline, pair.candidate, metric=metric, margin=config.margin, alpha=config.alpha)
-        for metric in metrics
+        run_metric(
+            pair.baseline, pair.candidate, metric=m, margin=g, alpha=config.alpha, alternative=config.alternative
+        )
+        for m, g in zip(metrics, margins * len(metrics) if len(margins) == 1 else margins)
     ]
     return PairedTestReport(**pair.report_identity(config, command), notes=notes, results=results)
 

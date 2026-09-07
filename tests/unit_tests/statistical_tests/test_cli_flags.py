@@ -43,13 +43,13 @@ class TestCliFlagTranslation:
                 "--metric",
                 "reward,output_tokens",
                 "--margin",
-                "0.01",
+                "0.01,0.02",
                 "--alpha",
                 "0.1",
             ]
         )
         assert config.metric == ["reward", "output_tokens"]
-        assert config.margin == 0.01
+        assert config.margin == [0.01, 0.02]
         assert config.alpha == 0.1
 
     def test_unset_flags_contribute_no_overrides(self):
@@ -75,13 +75,10 @@ class TestCliFlagTranslation:
                 "--metric",
                 "reward",
                 "--margin",
-                "0.01",
-                "--stats-output-dir",
-                "elsewhere",
+                "0.01,0.02",
                 "--no-stats",
             ]
         )
         assert '+metric=["reward"]' in overrides
-        assert "+margin=0.01" in overrides
-        assert '+stats_output_dirpath="elsewhere"' in overrides
+        assert '+margin=["0.01","0.02"]' in overrides
         assert "+no_stats=true" in overrides
